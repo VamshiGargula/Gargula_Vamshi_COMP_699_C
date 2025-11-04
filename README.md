@@ -97,8 +97,3 @@ Contributions welcome via pull requests. Focus areas:
 - Improve visualization library integration.
 - Add more data format handlers.
 - Expand recommendation engine algorithms.
-
-Follow the code style guidelines and include tests for new features.
-
-
-For issues or feature requests, open a GitHub issue.
