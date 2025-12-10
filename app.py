@@ -1,202 +1,269 @@
 import streamlit as st
-import ast
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from jinja2 import Template
+import graphviz
+from datetime import datetime
 import json
-import time
-import importlib.util
 import os
-from pathlib import Path
+import traceback
+import logging
+from io import StringIO
+import base64
 
-st.set_page_config(page_title='Task Automator Lab - Prototype', layout='wide')
+st.set_page_config(page_title="Task Automator Lab", layout="wide", page_icon="Lightning")
 
-if 'history' not in st.session_state:
-    st.session_state['history'] = []
-if 'workflow' not in st.session_state:
-    st.session_state['workflow'] = {}
+st.markdown("""
+<style>
+    body {background:#f0f4ff; margin:0; padding:0;}
+    .main {background:#f0f4ff; padding:0 2rem;}
+    h1 {
+        font-size:5.5rem; font-weight:900; text-align:center; 
+        background: linear-gradient(90deg, #1e40af, #3b82f6, #60a5fa);
+        -webkit-background-clip: text; background-clip: text;
+        color:transparent; margin:0; padding:2rem 0 0.5rem 0;
+        text-shadow: 0 10px 30px rgba(59,130,246,0.3);
+    }
+    .subtitle {
+        text-align:center; font-size:1.8rem; color:#64748b; font-weight:500; margin-bottom:3rem;
+    }
+    .card {
+        background:white; border-radius:24px; padding:32px; margin:30px 0;
+        box-shadow:0 20px 60px rgba(30,58,138,0.12);
+        border:1px solid rgba(59,130,246,0.15);
+        transition:all 0.4s;
+    }
+    .card:hover {
+        transform:translateY(-12px);
+        box-shadow:0 40px 100px rgba(30,58,138,0.2);
+    }
+    .glow-button {
+        background:linear-gradient(135deg,#3b82f6,#2563eb);
+        color:white; border:none; border-radius:18px;
+        padding:18px 40px; font-size:1.3rem; font-weight:700;
+        box-shadow:0 12px 40px rgba(59,130,246,0.4);
+        transition:all 0.3s;
+        cursor:pointer;
+    }
+    .glow-button:hover {
+        background:linear-gradient(135deg,#2563eb,#1d4ed8);
+        transform:translateY(-6px);
+        box-shadow:0 20px 50px rgba(59,130,246,0.5);
+    }
+    .step-card {
+        background:#f8fafc; border-radius:16px; padding:20px; margin:12px 0;
+        border-left:6px solid #3b82f6; box-shadow:0 8px 25px rgba(0,0,0,0.06);
+    }
+    .code-preview {
+        background:#1e293b; color:#e2e8f0; border-radius:16px; padding:24px;
+        font-family:'Courier New',monospace; font-size:1rem;
+        box-shadow:inset 0 8px 20px rgba(0,0,0,0.3);
+    }
+    .stTextInput > div > div > input,
+    .stTextArea > div > div > textarea {
+        border-radius:14px; border:2px solid #93c5fd; padding:14px;
+    }
+    .stSelectbox > div > div {border-radius:14px;}
+</style>
+""", unsafe_allow_html=True)
 
-st.title('Task Automator Lab')
+st.markdown("<h1>Task Automator Lab</h1>", unsafe_allow_html=True)
+st.markdown("<div class='subtitle'>Build • Visualize • Execute • Export Perfect Python</div>", unsafe_allow_html=True)
 
-with st.sidebar:
-    uploaded_module = st.file_uploader('Upload custom Python module (.py) to import functions', type=['py'])
-    smtp_host = st.text_input('SMTP host (optional)')
-    smtp_port = st.text_input('SMTP port (optional)')
-    smtp_user = st.text_input('SMTP user (optional)')
-    smtp_pass = st.text_input('SMTP pass (optional)', type='password')
+if 'workflows' not in st.session_state:
+    st.session_state.workflows = {}
+if 'current_id' not in st.session_state:
+    st.session_state.current_id = None
 
-st.header('1) Enter sequence of tasks in plain English (one per line)')
-raw_tasks = st.text_area('Tasks', placeholder='Example: Download file from SFTP\nProcess CSV and extract rows where status=active\nUpload results to S3')
-
-if st.button('Parse Tasks'):
-    lines = [l.strip() for l in raw_tasks.splitlines() if l.strip()]
-    steps = []
-    for i, l in enumerate(lines, 1):
-        steps.append({
-            'id': f'step_{i}',
-            'title': l,
-            'params': {},
-            'loop': None,
-            'retry': {'count': 0, 'delay': 0},
-            'exception_handler': '',
-            'custom_function': None,
-            'critical': False,
-            'alert': {'enabled': False, 'recipients': []}
-        })
-    st.session_state['workflow'] = {'name': 'workflow_' + str(int(time.time())), 'steps': steps}
-    st.session_state['history'].append(json.dumps(st.session_state['workflow']))
-    st.success(f'Parsed {len(steps)} steps')
-
-if st.session_state.get('workflow'):
-    wf = st.session_state['workflow']
-    st.header('Workflow:')
-    wf_name = st.text_input('Workflow name', value=wf.get('name'))
-    wf['name'] = wf_name
-    for step in wf['steps']:
-        with st.expander(step['title']):
-            title = st.text_input('Title', value=step['title'], key=step['id'] + '_title')
-            step['title'] = title
-            params_text = st.text_area('Input parameters as JSON (e.g. {"file_path":"string"})', value=json.dumps(step.get('params') or {}), key=step['id'] + '_params')
-            try:
-                step['params'] = json.loads(params_text)
-            except Exception:
-                st.error('Invalid JSON for params')
-            loop_type = st.selectbox('Loop type', options=['none', 'for', 'while'], index=0, key=step['id'] + '_loop_type')
-            if loop_type != 'none':
-                loop_expr = st.text_input('Loop expression (for: iterable variable; while: condition)', key=step['id'] + '_loop_expr')
-                step['loop'] = {'type': loop_type, 'expr': loop_expr}
-            else:
-                step['loop'] = None
-            retry_count = st.number_input('Retry count', min_value=0, step=1, value=step['retry'].get('count', 0), key=step['id'] + '_retry_count')
-            retry_delay = st.number_input('Retry delay seconds', min_value=0, step=1, value=step['retry'].get('delay', 0), key=step['id'] + '_retry_delay')
-            step['retry'] = {'count': int(retry_count), 'delay': int(retry_delay)}
-            exc_handler = st.text_area('Exception handler body (Python code to run in except block)', value=step.get('exception_handler', ''), key=step['id'] + '_exc')
-            step['exception_handler'] = exc_handler
-            custom_func_name = st.text_input('Custom function name to call (from uploaded module)', value=step.get('custom_function') or '', key=step['id'] + '_cust')
-            step['custom_function'] = custom_func_name or None
-            critical = st.checkbox('Mark task critical', value=step.get('critical', False), key=step['id'] + '_crit')
-            step['critical'] = critical
-            alert_enabled = st.checkbox('Enable alert for this task', value=step.get('alert', {}).get('enabled', False), key=step['id'] + '_alert')
-            recipients = st.text_input('Alert recipients (comma separated emails)', value=','.join(step.get('alert', {}).get('recipients', [])), key=step['id'] + '_alert_recip')
-            step['alert'] = {'enabled': alert_enabled, 'recipients': [r.strip() for r in recipients.split(',') if r.strip()]}
-
-    st.session_state['workflow'] = wf
-
-    st.header('2) Generated script (editable)')
-
-    def build_script(workflow, module_filename=None):
-        lines = []
-        lines.append('import logging')
-        lines.append('import time')
-        if smtp_host and smtp_port and smtp_user and smtp_pass:
-            lines.append('import smtplib')
-            lines.append('from email.message import EmailMessage')
-        if module_filename:
-            lines.append('import importlib.util')
-            lines.append("spec=importlib.util.spec_from_file_location('custom', r'" + module_filename.replace("\\", "\\\\") + "')")
-            lines.append("custom=importlib.util.module_from_spec(spec)")
-            lines.append('spec.loader.exec_module(custom)')
-        lines.append("logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')")
-        lines.append('def send_alert(subject,body,recipients):')
-        if smtp_host and smtp_port and smtp_user and smtp_pass:
-            lines.append('    msg=EmailMessage()')
-            lines.append("    msg['Subject']=subject")
-            lines.append("    msg.set_content(body)")
-            lines.append('    with smtplib.SMTP_SSL("' + smtp_host + '",' + smtp_port + ') as s:')
-            lines.append('        s.login("' + smtp_user + '","' + smtp_pass + '")')
-            lines.append('        s.send_message(msg)')
-        else:
-            lines.append('    return')
-        for step in workflow['steps']:
-            fn_name = step['id']
-            lines.append('def ' + fn_name + '(context):')
-            if step['params']:
-                lines.append('    params=context.get("' + fn_name + '_params",{})')
-            if step['custom_function']:
-                lines.append('    if hasattr(custom,"' + step['custom_function'] + '"):')
-                lines.append('        func=getattr(custom,"' + step['custom_function'] + '")')
-                lines.append('        return func(**(context.get("' + fn_name + '_params",{})))')
-            if step['loop']:
-                if step['loop']['type'] == 'for':
-                    lines.append('    for item in ' + (step['loop']['expr'] or '[]') + ':')
-                    lines.append('        logging.info("running ' + fn_name + ' iteration")')
-                    body_prefix = '        '
-                else:
-                    lines.append('    while ' + (step['loop']['expr'] or 'False') + ':')
-                    lines.append('        logging.info("running ' + fn_name + ' iteration")')
-                    body_prefix = '        '
-            else:
-                body_prefix = '    '
-            if not step['custom_function']:
-                lines.append(body_prefix + "logging.info('Executing: " + step['title'].replace("'", "\\'") + "')")
-            if step['retry'] and step['retry'].get('count', 0) > 0:
-                lines.append(body_prefix + 'attempt=0')
-                lines.append(body_prefix + 'while attempt<' + str(step['retry']['count']) + ':')
-                lines.append(body_prefix + '    try:')
-                lines.append(body_prefix + '        pass')
-                lines.append(body_prefix + '        break')
-                lines.append(body_prefix + '    except Exception as e:')
-                if step['exception_handler']:
-                    for l in step['exception_handler'].splitlines():
-                        lines.append(body_prefix + '    ' + l)
-                lines.append(body_prefix + '    attempt+=1')
-                lines.append(body_prefix + '    time.sleep(' + str(step['retry']['delay']) + ')')
-            else:
-                if step['exception_handler']:
-                    lines.append(body_prefix + 'try:')
-                    lines.append(body_prefix + '    pass')
-                    lines.append(body_prefix + 'except Exception as e:')
-                    for l in step['exception_handler'].splitlines():
-                        lines.append(body_prefix + '    ' + l)
-            if step['critical']:
-                lines.append(body_prefix + "logging.error('Task " + fn_name + " marked critical - check results')")
-            if step['alert'] and step['alert'].get('enabled') and smtp_host and smtp_port and smtp_user and smtp_pass:
-                lines.append(body_prefix + "send_alert('Alert: " + fn_name.replace("'", "\\'") + "','Task reported issue'," + str(step['alert'].get('recipients', [])) + ')')
-        lines.append('def run_workflow():')
-        lines.append('    context={}')
-        for step in workflow['steps']:
-            lines.append('    ' + step['id'] + '(context)')
-        lines.append("if __name__=='__main__':")
-        lines.append('    run_workflow()')
-        return '\n'.join(lines)
-
-    module_path = None
-    if uploaded_module is not None:
-        module_path = os.path.join('uploaded_modules', uploaded_module.name)
-        Path('uploaded_modules').mkdir(exist_ok=True)
-        with open(module_path, 'wb') as f:
-            f.write(uploaded_module.getvalue())
-
-    script_text = build_script(wf, module_path)
-    editor = st.text_area('Script editor', value=script_text, height=400, key='script_editor')
-
+def generate_code(steps):
+    template = """
+import pandas as pd
+import logging
+import time
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+def retry(func, max_attempts=3, delay=1):
+    for attempt in range(max_attempts):
+        try:
+            return func()
+        except Exception as e:
+            if attempt == max_attempts - 1:
+                logger.error(f"Failed after {max_attempts} attempts: {e}")
+                raise
+            logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {delay}s...")
+            time.sleep(delay)
+def main():
     try:
-        ast.parse(editor)
-        valid = True
+        logger.info("Starting automation workflow")
+       
+        {% for step in steps %}
+        # Step {{ loop.index }}: {{ step.name }}
+        logger.info("Executing: {{ step.name }}")
+        try:
+            {% if step.type == "read_csv" %}
+            df_{{ loop.index }} = pd.read_csv("{{ step.params.file }}")
+            logger.info(f"Loaded {{ step.params.file }} - {len(df_{{ loop.index }})} rows")
+            {% elif step.type == "filter" %}
+            df_{{ loop.index }} = df_{{ step.params.source }}.query("{{ step.params.condition }}")
+            logger.info(f"Filtered data - {len(df_{{ loop.index }})} rows remaining")
+            {% elif step.type == "write_excel" %}
+            df_{{ step.params.source }}.to_excel("{{ step.params.output }}", index=False)
+            logger.info(f"Saved to {{ step.params.output }}")
+            {% elif step.type == "custom" %}
+            {% if step.code.strip() %}
+{{ step.code | indent(12) }}
+            {% else %}
+            pass
+            {% endif %}
+            {% endif %}
+        except Exception as e:
+            logger.error(f"Step {{ loop.index }} failed: {e}")
+            raise
+       
+        {% endfor %}
+       
+        logger.info("Workflow completed successfully!")
+       
     except Exception as e:
-        valid = False
-        st.error('Script has syntax errors: ' + str(e))
+        logger.critical(f"Workflow failed: {e}")
+        raise
+if __name__ == "__main__":
+    main()
+"""
+    t = Template(template)
+    return t.render(steps=steps)
 
-    if st.button('Save script to file') and valid:
-        filename = st.text_input('Output filename', value=wf['name'] + '.py', key='out_file')
-        if filename:
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write(editor)
-            st.success(f'Saved to {filename}')
+def create_3d_flow(steps):
+    if not steps:
+        return go.Figure()
+    
+    x = list(range(len(steps)))
+    y = [0] * len(steps)
+    z = [np.sin(i/1.8)*4 for i in range(len(steps))]
+    
+    fig = go.Figure()
+    
+    for i, step in enumerate(steps):
+        fig.add_trace(go.Scatter3d(
+            x=[x[i]], y=[y[i]], z=[z[i]],
+            mode='markers+text',
+            marker=dict(size=50, color='#3b82f6', opacity=0.95, line=dict(width=4, color='#1e40af')),
+            text=step['name'],
+            textposition="middle center",
+            textfont=dict(size=16, color="white"),
+            name=step['name'],
+            hoverinfo="text",
+            hovertext=f"<b>{step['name']}</b><br>Type: {step['type'].replace('_',' ').title()}"
+        ))
+    
+    for i in range(1, len(steps)):
+        fig.add_trace(go.Scatter3d(
+            x=[x[i-1], x[i]], y=[0,0], z=[z[i-1], z[i]],
+            mode='lines',
+            line=dict(color='#1e40af', width=12),
+            hoverinfo='none'
+        ))
+    
+    fig.update_layout(
+        scene=dict(
+            xaxis=dict(showticklabels=False, showgrid=False, zeroline=False, backgroundcolor="white"),
+            yaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+            zaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+            camera=dict(eye=dict(x=1.8, y=1.8, z=1.8))
+        ),
+        paper_bgcolor="#f0f4ff",
+        plot_bgcolor="#f0f4ff",
+        height=700,
+        margin=dict(l=0,r=0,b=0,t=0)
+    )
+    return fig
 
-    st.download_button('Download script', data=editor, file_name=wf['name'] + '.py', mime='text/x-python')
+# MAIN LAYOUT
+col_left, col_right = st.columns([1.8, 1.2])
 
-    st.header('3) Edit history (session)')
-    for i, h in enumerate(st.session_state['history']):
-        st.write(f'Version {i+1} - {json.loads(h).get("name") if h else ""}')
+with col_left:
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("### Workflow Studio")
 
-    if st.button('Save workflow template'):
-        template_name = st.text_input('Template filename', value=wf['name'] + '_template.json', key='template_name')
-        if template_name:
-            with open(template_name, 'w', encoding='utf-8') as f:
-                json.dump(wf, f, indent=2)
-            st.success(f'Template saved to {template_name}')
+    if st.button("New Workflow", key="new_wf"):
+        st.session_state.current_id = len(st.session_state.workflows)
+        st.session_state.workflows[st.session_state.current_id] = {
+            "name": "New Workflow",
+            "steps": [],
+            "created": datetime.now().isoformat()
+        }
+        st.rerun()
 
-    st.header('4) Import custom functions into runtime (demo)')
-    if module_path and st.button('Load uploaded module now'):
-        spec = importlib.util.spec_from_file_location('custom', module_path)
-        custom = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(custom)
-        st.success('Module loaded as variable "custom" in generated script when executed')
+    if st.session_state.workflows:
+        selected = st.selectbox("My Workflows",
+            options=list(st.session_state.workflows.keys()),
+            format_func=lambda x: st.session_state.workflows[x]["name"],
+            key="wf_select")
+        workflow = st.session_state.workflows[selected]
+
+        workflow["name"] = st.text_input("Workflow Name", workflow["name"], key="wf_name")
+
+        st.markdown("### Add Step")
+        step_type = st.selectbox("Step Type", [
+            "Read CSV", "Filter Data", "Transform Column", "Write Excel", "Send Email", "Custom Code"
+        ], key="step_type")
+
+        step_name = st.text_input("Step Name", f"Step {len(workflow['steps'])+1}", key="step_name")
+
+        params = {}
+        if "CSV" in step_type:
+            params["file"] = st.text_input("CSV File Path", "data/input.csv", key="csv_path")
+        elif "Filter" in step_type:
+            params["source"] = st.selectbox("Source Data", ["Previous Step"], key="filter_src")
+            params["condition"] = st.text_area("Filter Condition", "age > 30", key="filter_cond")
+        elif "Transform" in step_type:
+            params["column"] = st.text_input("Column to Transform", key="trans_col")
+            params["operation"] = st.text_input("Operation (Python)", key="trans_op")
+        elif "Excel" in step_type:
+            params["output"] = st.text_input("Output File", "output/report.xlsx", key="excel_out")
+
+        code = ""
+        if "Custom" in step_type:
+            code = st.text_area("Custom Python Code", height=200, key="custom_code",
+                               placeholder="def process(data):\n    return data.upper()")
+
+        if st.button("Add Step", key="add_step"):
+            new_step = {
+                "name": step_name,
+                "type": step_type.lower().replace(" ", "_"),
+                "params": params,
+                "code": code
+            }
+            workflow["steps"].append(new_step)
+            st.success("Step added!")
+            st.rerun()
+
+        if workflow["steps"]:
+            st.markdown("### Generated Python Code")
+            code = generate_code(workflow["steps"])
+            st.code(code, language="python")
+            st.download_button("Export Script", code, f"{workflow['name'].replace(' ','_')}.py", "text/python", key="export")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with col_right:
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("### Instant 3D Workflow View")
+    if st.session_state.current_id is not None and st.session_state.workflows[st.session_state.current_id]["steps"]:
+        steps = st.session_state.workflows[st.session_state.current_id]["steps"]
+        fig = create_3d_flow(steps)
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Add steps to see instant 3D visualization")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("### Workflow Library")
+    for wid, wf in st.session_state.workflows.items():
+        with st.expander(f"{wf['name']} • {len(wf['steps'])} steps"):
+            st.write(f"Created: {wf.get('created','N/A')[:10]}")
+            if st.button("Load", key=f"load_{wid}"):
+                st.session_state.current_id = wid
+                st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
